@@ -33,49 +33,49 @@ from app.agent.mcp_client import (
 # 同时也需要配置环境变量 DASHSCOPE_API_KEY=your_api_key
 
 
-#class AgentState(TypedDict):
-#    """Agent 状态"""
-#    messages: Annotated[Sequence[BaseMessage], add_messages]
-#
-#
-#def trim_messages_middleware(state: AgentState) -> dict[str, Any] | None:
-#    """
-#    修剪消息历史，只保留最近的几条消息以适应上下文窗口
-#
-#    策略：
-#    - 保留第一条系统消息（System Message）
-#    - 保留最近的 6 条消息（3 轮对话）
-#    - 当消息少于等于 7 条时，不做修剪
-#
-#    Args:
-#        state: Agent 状态
-#
-#    Returns:
-#        包含修剪后消息的字典，如果无需修剪则返回 None
-#    """
-#    messages = state["messages"]
-#
-#    # 如果消息数量较少，无需修剪
-#    if len(messages) <= 7:
-#        return None
-#
-#    # 提取第一条系统消息
-#    first_msg = messages[0]
-#
-#    # 保留最近的 6 条消息（确保包含完整的对话轮次）
-#    recent_messages = messages[-6:] if len(messages) % 2 == 0 else messages[-7:]
-#
-#    # 构建新的消息列表
-#    new_messages = [first_msg] + list(recent_messages)
-#
-#    logger.debug(f"修剪消息历史: {len(messages)} -> {len(new_messages)} 条")
-#
-#    return {
-#        "messages": [
-#            RemoveMessage(id=REMOVE_ALL_MESSAGES),
-#            *new_messages
-#        ]
-#    }
+class AgentState(TypedDict):
+    """Agent 状态"""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+
+
+def trim_messages_middleware(state: AgentState) -> dict[str, Any] | None:
+    """
+    修剪消息历史，只保留最近的几条消息以适应上下文窗口
+
+    策略：
+    - 保留第一条系统消息（System Message）
+    - 保留最近的 6 条消息（3 轮对话）
+    - 当消息少于等于 7 条时，不做修剪
+
+    Args:
+        state: Agent 状态
+
+    Returns:
+        包含修剪后消息的字典，如果无需修剪则返回 None
+    """
+    messages = state["messages"]
+
+    # 如果消息数量较少，无需修剪
+    if len(messages) <= 7:
+        return None
+
+    # 提取第一条系统消息
+    first_msg = messages[0]
+
+    # 保留最近的 6 条消息（确保包含完整的对话轮次）
+    recent_messages = messages[-6:] if len(messages) % 2 == 0 else messages[-7:]
+
+    # 构建新的消息列表
+    new_messages = [first_msg] + list(recent_messages)
+
+    logger.debug(f"修剪消息历史: {len(messages)} -> {len(new_messages)} 条")
+
+    return {
+        "messages": [
+            RemoveMessage(id=REMOVE_ALL_MESSAGES),
+            *new_messages
+        ]
+    }
 
 
 class RagAgentService:

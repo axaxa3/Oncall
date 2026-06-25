@@ -18,7 +18,7 @@ from .state import PlanExecuteState
 async def executor(state: PlanExecuteState) -> Dict[str, Any]:
     """
     执行节点：执行计划中的下一个步骤
-    
+
     使用 LangGraph 的 ToolNode 自动处理工具调用
     """
     logger.info("=== Executor：执行步骤 ===")
@@ -82,11 +82,11 @@ async def executor(state: PlanExecuteState) -> Dict[str, Any]:
         # 第二步：如果有工具调用，执行工具
         if hasattr(llm_response, "tool_calls") and llm_response.tool_calls:
             logger.info(f"检测到 {len(llm_response.tool_calls)} 个工具调用")
-            
+
             # 使用 ToolNode 自动执行工具
             messages.append(llm_response)
             tool_messages = await tool_node.ainvoke({"messages": messages})
-            
+
             # 第三步：将工具结果返回给 LLM 生成最终答案
             messages.extend(tool_messages["messages"])
             final_response = await llm_with_tools.ainvoke(messages)

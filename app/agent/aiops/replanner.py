@@ -211,12 +211,12 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
                         f"强制截断为 {len(plan)} 个步骤"
                     )
                     new_steps = new_steps[:len(plan)]
-                
+
                 # ⚠️ 二次检查：如果已执行步骤 >= 5，禁止 replan
                 if len(past_steps) >= 5:
                     logger.warning(f"已执行 {len(past_steps)} 个步骤，禁止重新规划，强制生成响应")
                     return await _generate_response(state, llm)
-                
+
                 logger.info(f"决定调整计划，新步骤数量: {len(new_steps)}")
                 if new_steps:
                     # 替换剩余计划

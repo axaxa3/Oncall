@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 30s       # 每 30 秒抓取一次指标
+  evaluation_interval: 30s   # 每 30 秒评估一次规则
+
+# 告警规则文件
+rule_files:
+  - "alert_rules.yml"
+
+# 抓取配置
+scrape_configs:
+  # Prometheus 自监控
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          instance: "prometheus-server"
+
+  # Node Exporter — 系统级指标（CPU、内存、磁盘、网络、进程）
+  # 暴露指标: node_cpu_seconds_total, node_memory_*, node_filesystem_*,
+  #          node_network_*, node_procs_running, node_procs_blocked
+  - job_name: "node_exporter"
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
+        labels:
+          instance: "localhost"

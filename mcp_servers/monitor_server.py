@@ -3,17 +3,18 @@
 本地实现的监控服务 MCP Server，提供：
 - 监控数据查询（CPU、内存、磁盘、网络等）
 - 进程信息查询
-- 历史工单查询
-- 服务信息查询
 
-用于支持运维 Agent 的故障排查场景。
+数据来源：
+- Prometheus 查询（适用于 Linux 环境，通过 Node Exporter）
+- 本地 Windows 磁盘查询（通过 psutil，适用于 Windows 本机）
+- Prometheus 不可用时 fallback 到模拟数据
 """
 
 import logging
 import functools
 import json
 import random
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from fastmcp import FastMCP
 
@@ -33,13 +34,10 @@ def log_tool_call(func):
     def wrapper(*args, **kwargs):
         method_name = func.__name__
 
-        # 记录调用信息
         logger.info(f"=" * 80)
         logger.info(f"调用方法: {method_name}")
 
-        # 记录参数（排除self等）
         if kwargs:
-            # 使用 json.dumps 格式化参数，处理可能的序列化错误
             try:
                 params_str = json.dumps(kwargs, ensure_ascii=False, indent=2)
             except (TypeError, ValueError):
@@ -48,14 +46,10 @@ def log_tool_call(func):
         else:
             logger.info("参数信息: 无")
 
-        # 执行方法
         try:
             result = func(*args, **kwargs)
-
-            # 记录返回状态
             logger.info(f"返回状态: SUCCESS")
 
-            # 记录返回结果摘要（避免日志过长）
             if isinstance(result, dict):
                 summary = {k: v if not isinstance(v, (list, dict)) else f"<{type(v).__name__} with {len(v)} items>"
                           for k, v in list(result.items())[:5]}
@@ -67,7 +61,6 @@ def log_tool_call(func):
             return result
 
         except Exception as e:
-            # 记录错误状态
             logger.error(f"返回状态: ERROR")
             logger.error(f"错误信息: {str(e)}")
             logger.error(f"=" * 80)
@@ -77,44 +70,238 @@ def log_tool_call(func):
 
 
 # ============================================================
-# 辅助函数
+# Prometheus 配置与客户端
 # ============================================================
 
-def parse_time_or_default(time_str: Optional[str], default_offset_hours: int = 0) -> datetime:
-    """解析时间字符串或返回默认时间。
+PROMETHEUS_BASE_URL: str = "http://127.0.0.1:9090"
+PROMETHEUS_REQUEST_TIMEOUT: float = 10.0
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    import os
+    PROMETHEUS_BASE_URL = os.getenv("PROMETHEUS_BASE_URL", PROMETHEUS_BASE_URL)
+    PROMETHEUS_REQUEST_TIMEOUT = float(os.getenv("PROMETHEUS_REQUEST_TIMEOUT", PROMETHEUS_REQUEST_TIMEOUT))
+except ImportError:
+    pass
+
+
+def query_prometheus(promql: str, start: Optional[str] = None, end: Optional[str] = None,
+                     step: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """查询 Prometheus /api/v1/query_range。
 
     Args:
-        time_str: 时间字符串（格式：YYYY-MM-DD HH:MM:SS）
-        default_offset_hours: 默认时间偏移（小时）
+        promql: PromQL 查询表达式
+        start: 开始时间（Unix 时间戳秒数，字符串）
+        end: 结束时间（Unix 时间戳秒数，字符串）
+        step: 查询步长（如 "60s", "5m"）
 
     Returns:
-        datetime: 解析后的时间对象
+        Prometheus data 字典（含 resultType 和 result），失败时返回 None
     """
+    import httpx
+
+    base_url = PROMETHEUS_BASE_URL.rstrip("/")
+    api_url = f"{base_url}/api/v1/query_range"
+
+    params = {"query": promql}
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+    if step:
+        params["step"] = step
+
+    try:
+        with httpx.Client(timeout=PROMETHEUS_REQUEST_TIMEOUT) as client:
+            resp = client.get(api_url, params=params)
+            resp.raise_for_status()
+            body = resp.json()
+            if body.get("status") == "success":
+                return body.get("data", {})
+            logger.warning(f"Prometheus query failed: {body}")
+            return None
+    except httpx.HTTPError as e:
+        logger.warning(f"Prometheus connection failed ({api_url}): {e}")
+        return None
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.warning(f"Prometheus response parse failed: {e}")
+        return None
+
+
+def query_prometheus_single(promql: str, time: Optional[str] = None) -> Optional[float]:
+    """查询 Prometheus /api/v1/query 瞬时值。
+
+    Returns:
+        指标值（float），失败时返回 None
+    """
+    import httpx
+
+    base_url = PROMETHEUS_BASE_URL.rstrip("/")
+    api_url = f"{base_url}/api/v1/query"
+
+    params = {"query": promql}
+    if time:
+        params["time"] = time
+
+    try:
+        with httpx.Client(timeout=PROMETHEUS_REQUEST_TIMEOUT) as client:
+            resp = client.get(api_url, params=params)
+            resp.raise_for_status()
+            body = resp.json()
+            if body.get("status") == "success":
+                result = body.get("data", {}).get("result", [])
+                if result:
+                    value = result[0].get("value", [None, "0"])
+                    return float(value[1])
+            return None
+    except httpx.HTTPError as e:
+        logger.warning(f"Prometheus connection failed ({api_url}): {e}")
+        return None
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.warning(f"Prometheus response parse failed: {e}")
+        return None
+
+
+def epoch_timestamp(dt: datetime) -> str:
+    """将 datetime 转为 Unix 时间戳秒数（字符串），供 Prometheus API 使用。"""
+    return str(int(dt.timestamp()))
+
+
+def parse_step(interval: str) -> str:
+    """将 interval 字符串转为 Prometheus step 格式。"""
+    if interval.endswith('m'):
+        val = int(interval[:-1])
+        return f"{max(val * 60, 60)}s"
+    elif interval.endswith('h'):
+        val = int(interval[:-1]) * 60
+        return f"{val}m"
+    return "60s"
+
+
+def parse_time_or_default(time_str: Optional[str], default_offset_hours: int = 0) -> datetime:
+    """解析时间字符串或返回默认时间。"""
     if time_str:
         try:
             return datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
         except ValueError:
             pass
-    # 返回默认时间（当前时间 + 偏移）
     return datetime.now() + timedelta(hours=default_offset_hours)
 
 
-def generate_time_series(base_time: datetime, minutes_offset: int, format_str: str = "%Y-%m-%d %H:%M:%S") -> str:
-    """生成时间序列字符串。
+def build_data_points(raw_values: List[List[str]], base_time: datetime,
+                      interval_minutes: int, extra: Optional[Dict] = None) -> List[Dict]:
+    """将 Prometheus 原始值列表转为统一的数据点格式。
 
-    Args:
-        base_time: 基准时间
-        minutes_offset: 分钟偏移量
-        format_str: 时间格式字符串
-
-    Returns:
-        str: 格式化的时间字符串
+    raw_values 格式: [["timestamp_str", "value_str"], ...]
     """
-    result_time = base_time + timedelta(minutes=minutes_offset)
-    return result_time.strftime(format_str)
+    data_points = []
+    for i, (ts_str, val_str) in enumerate(raw_values):
+        try:
+            ts = float(ts_str)
+            value = float(val_str)
+        except (ValueError, TypeError):
+            continue
+        dt = datetime.fromtimestamp(ts)
+        point = {"timestamp": dt.strftime("%H:%M"), "value": round(value, 2)}
+        if extra:
+            point.update(extra)
+        data_points.append(point)
+    return data_points
 
 
+def compute_stats(values: List[float], thresholds: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """计算统计数据。"""
+    if not values:
+        return {}
+    avg_v = round(sum(values) / len(values), 2)
+    max_v = round(max(values), 2)
+    min_v = round(min(values), 2)
+    sv = sorted(values)
+    p95_v = round(sv[max(0, int(len(sv) * 0.95) - 1)], 2)
 
+    stats = {"avg": avg_v, "max": max_v, "min": min_v, "p95": p95_v}
+    if thresholds:
+        for key, threshold in thresholds.items():
+            stats[f"{key}_detected"] = max_v > threshold
+    return stats
+
+
+# ============================================================
+# 模拟数据 Fallback（Prometheus 不可用时使用）
+# ============================================================
+
+def gen_fallback_cpu(start_dt: datetime, end_dt: datetime, interval_minutes: int) -> List[Dict]:
+    data_points = []
+    ct = start_dt
+    idx = 0
+    base = 10.0
+    while ct <= end_dt:
+        if idx < 3:
+            v = base + idx * 0.5
+        else:
+            v = min(base + (idx - 2) * 8.5, 96.0)
+        v = round(max(0, min(100, v + random.uniform(-2, 2))), 1)
+        data_points.append({"timestamp": ct.strftime("%H:%M"), "value": v, "process_id": "pid-12345"})
+        ct += timedelta(minutes=interval_minutes)
+        idx += 1
+    return data_points
+
+
+def gen_fallback_memory(start_dt: datetime, end_dt: datetime, interval_minutes: int) -> List[Dict]:
+    data_points = []
+    ct = start_dt
+    idx = 0
+    base = 30.0
+    total_gb = 8.0
+    while ct <= end_dt:
+        if idx < 3:
+            v = base + idx * 1.0
+        else:
+            v = min(base + (idx - 2) * 5.5, 85.0)
+        v = round(max(0, min(100, v + random.uniform(-1, 1))), 1)
+        data_points.append({
+            "timestamp": ct.strftime("%H:%M"), "value": v,
+            "used_gb": round((v / 100.0) * total_gb, 2), "total_gb": total_gb
+        })
+        ct += timedelta(minutes=interval_minutes)
+        idx += 1
+    return data_points
+
+
+def gen_fallback_disk(start_dt: datetime, end_dt: datetime, interval_minutes: int) -> List[Dict]:
+    data_points = []
+    ct = start_dt
+    idx = 0
+    base = 45.0
+    while ct <= end_dt:
+        if idx < 3:
+            v = base + idx * 0.3
+        else:
+            v = min(base + (idx - 2) * 3.0, 88.0)
+        v = round(max(0, min(100, v + random.uniform(-1, 1))), 1)
+        data_points.append({"timestamp": ct.strftime("%H:%M"), "value": v, "mount_point": "/"})
+        ct += timedelta(minutes=interval_minutes)
+        idx += 1
+    return data_points
+
+
+def gen_fallback_network(start_dt: datetime, end_dt: datetime, interval_minutes: int) -> List[Dict]:
+    data_points = []
+    ct = start_dt
+    idx = 0
+    while ct <= end_dt:
+        rx = round(random.uniform(10, 100) + idx * 5, 2)
+        tx = round(random.uniform(5, 50) + idx * 3, 2)
+        data_points.append({
+            "timestamp": ct.strftime("%H:%M"),
+            "rx_bytes_per_sec": round(rx * 1_000_000 / 8, 2),
+            "tx_bytes_per_sec": round(tx * 1_000_000 / 8, 2),
+            "rx_mbps": rx, "tx_mbps": tx
+        })
+        ct += timedelta(minutes=interval_minutes)
+        idx += 1
+    return data_points
 
 
 # ============================================================
@@ -131,147 +318,74 @@ def query_cpu_metrics(
 ) -> Dict[str, Any]:
     """查询服务的 CPU 使用率监控数据。
 
+    数据来源：优先从 Prometheus 查询 node_cpu_seconds_total，
+    如果 Prometheus 不可用则 fallback 到模拟数据。
+
     Args:
         service_name: 服务名称（必填）
-            示例: "data-sync-service"
-        
-        start_time: 开始时间（可选，字符串类型）
-            格式: "YYYY-MM-DD HH:MM:SS"
-            示例: "2026-02-14 10:00:00"
-            默认值: 如果不传，默认为当前时间的1小时前
-            注意: 必须使用字符串格式，而非时间戳
-        
-        end_time: 结束时间（可选，字符串类型）
-            格式: "YYYY-MM-DD HH:MM:SS"
-            示例: "2026-02-14 11:00:00"
-            默认值: 如果不传，默认为当前时间
-            注意: 必须使用字符串格式，而非时间戳
-        
-        interval: 数据聚合间隔（可选）
-            可选值: "1m" (1分钟), "5m" (5分钟), "1h" (1小时)
-            默认值: "1m"
-            说明: 控制数据点的时间间隔
+        start_time: 开始时间（可选），格式: "YYYY-MM-DD HH:MM:SS"
+        end_time: 结束时间（可选），格式: "YYYY-MM-DD HH:MM:SS"
+        interval: 数据聚合间隔（可选），可选值: "1m", "5m", "1h"
 
     Returns:
-        Dict: CPU 监控数据
-            - service_name: 服务名称
-            - metric_name: 指标名称 (cpu_usage_percent)
-            - interval: 数据聚合间隔
-            - data_points: 数据点列表，每个点包含:
-                * timestamp: 时间点（格式: HH:MM）
-                * value: CPU 使用率百分比
-            - statistics: 统计信息
-                * average: 平均值
-                * max: 最大值
-                * min: 最小值
-            - alert: 告警信息（如有）
-                * triggered: 是否触发告警
-                * threshold: 告警阈值
-                * message: 告警消息
-    
-    使用示例:
-        # 示例1: 使用默认时间（最近1小时）
-        query_cpu_metrics(service_name="data-sync-service")
-        
-        # 示例2: 指定时间范围
-        query_cpu_metrics(
-            service_name="data-sync-service",
-            start_time="2026-02-14 10:00:00",
-            end_time="2026-02-14 11:00:00",
-            interval="5m"
-        )
-        
-        # 示例3: 只指定开始时间（结束时间自动为当前时间）
-        query_cpu_metrics(
-            service_name="data-sync-service",
-            start_time="2026-02-14 10:00:00"
-        )
+        Dict: CPU 监控数据，包含 data_source 字段标明数据来源
     """
-    # 解析时间参数
     start_dt = parse_time_or_default(start_time, default_offset_hours=-1)
     end_dt = parse_time_or_default(end_time, default_offset_hours=0)
-    
-    # 解析间隔时间（interval: 1m, 5m, 1h 等）
-    interval_minutes = 1  # 默认 1 分钟
+
+    interval_minutes = 1
     if interval.endswith('m'):
         interval_minutes = int(interval[:-1])
     elif interval.endswith('h'):
         interval_minutes = int(interval[:-1]) * 60
 
-    # 动态生成 CPU 使用率数据：从低到高逐渐增长
-    data_points = []
-    current_time = start_dt
-    time_index = 0
+    step = parse_step(interval)
+    start_ep = epoch_timestamp(start_dt)
+    end_ep = epoch_timestamp(end_dt)
 
-    # 初始 CPU 使用率（10%）
-    base_cpu = 10.0
+    # PromQL: 计算 CPU 使用率 = 100 * (1 - idle_rate)
+    promql = (
+        f'100 * (1 - avg(rate(node_cpu_seconds_total{{mode="idle", '
+        f'job="node_exporter"}}[{step}])) by (instance))'
+    )
 
-    while current_time <= end_dt:
-        # CPU 使用率逐渐升高的算法：
-        # - 前几个数据点保持在 10% 左右
-        # - 然后开始快速上升
-        # - 最终达到 95% 左右
+    result = query_prometheus(promql, start=start_ep, end=end_ep, step=step)
 
-        if time_index < 3:
-            # 初始阶段：10% 左右波动
-            cpu_value = base_cpu + (time_index * 0.5)
+    if result and result.get("result"):
+        raw_values = result["result"][0].get("values", [])
+        data_points = build_data_points(raw_values, start_dt, interval_minutes)
+        if data_points:
+            source = "Prometheus"
         else:
-            # 上升阶段：使用指数增长模型
-            growth_factor = (time_index - 2) * 8.5
-            cpu_value = min(base_cpu + growth_factor, 96.0)
+            data_points = gen_fallback_cpu(start_dt, end_dt, interval_minutes)
+            source = "模拟数据 (Prometheus 无数据)"
+    else:
+        data_points = gen_fallback_cpu(start_dt, end_dt, interval_minutes)
+        source = "模拟数据 (Prometheus 不可用)"
 
-        # 添加一些随机波动（±2%）
-        cpu_value = round(cpu_value + random.uniform(-2, 2), 1)
-        cpu_value = max(0, min(100, cpu_value))  # 确保在 0-100 范围内
-
-        data_point = {
-            "timestamp": current_time.strftime("%H:%M"),
-            "value": cpu_value,
-            "process_id": "pid-12345"
-        }
-
-        data_points.append(data_point)
-
-        # 下一个时间点
-        current_time += timedelta(minutes=interval_minutes)
-        time_index += 1
-
-    # 计算统计信息
     if data_points:
         values = [d["value"] for d in data_points]
-        avg_value = round(sum(values) / len(values), 2)
-        max_value = max(values)
-        min_value = min(values)
-
-        # 检测是否有 CPU 突增（超过 80%）
-        spike_detected = max_value > 80.0
+        stats = compute_stats(values, {"spike": 80.0})
+        spike = stats.pop("spike_detected", False)
 
         return {
             "service_name": service_name,
             "metric_name": "cpu_usage_percent",
             "interval": interval,
+            "data_source": source,
             "data_points": data_points,
-            "statistics": {
-                "avg": avg_value,
-                "max": max_value,
-                "min": min_value,
-                "p95": round(sorted(values)[int(len(values) * 0.95)] if len(values) > 1 else max_value, 2),
-                "spike_detected": spike_detected
-            },
+            "statistics": stats,
             "alert_info": {
-                "triggered": spike_detected,
+                "triggered": spike,
                 "threshold": 80.0,
-                "message": "CPU 使用率持续超过 80% 阈值" if spike_detected else "CPU 使用率正常"
+                "message": "CPU 使用率持续超过 80% 阈值" if spike else "CPU 使用率正常"
             }
         }
-    else:
-        return {
-            "service_name": service_name,
-            "metric_name": "cpu_usage_percent",
-            "interval": interval,
-            "data_points": [],
-            "statistics": {},
-        }
+    return {
+        "service_name": service_name, "metric_name": "cpu_usage_percent",
+        "interval": interval, "data_source": source,
+        "data_points": [], "statistics": {}, "error": "未能获取 CPU 数据"
+    }
 
 
 @mcp.tool()
@@ -284,152 +398,395 @@ def query_memory_metrics(
 ) -> Dict[str, Any]:
     """查询服务的内存使用监控数据。
 
-    Args:
-        service_name: 服务名称（必填）
-            示例: "data-sync-service"
-        
-        start_time: 开始时间（可选，字符串类型）
-            格式: "YYYY-MM-DD HH:MM:SS"
-            示例: "2026-02-14 10:00:00"
-            默认值: 如果不传，默认为当前时间的1小时前
-            注意: 必须使用字符串格式，而非时间戳
-        
-        end_time: 结束时间（可选，字符串类型）
-            格式: "YYYY-MM-DD HH:MM:SS"
-            示例: "2026-02-14 11:00:00"
-            默认值: 如果不传，默认为当前时间
-            注意: 必须使用字符串格式，而非时间戳
-        
-        interval: 数据聚合间隔（可选）
-            可选值: "1m" (1分钟), "5m" (5分钟), "1h" (1小时)
-            默认值: "1m"
-
-    Returns:
-        Dict: 内存监控数据
-            - service_name: 服务名称
-            - metric_name: 指标名称 (memory_usage_percent)
-            - interval: 数据聚合间隔
-            - data_points: 数据点列表，每个点包含:
-                * timestamp: 时间点（格式: HH:MM）
-                * value: 内存使用率百分比
-                * used_gb: 已使用内存（GB）
-                * total_gb: 总内存（GB）
-            - statistics: 统计信息
-                * average: 平均值
-                * max: 最大值
-                * min: 最小值
-            - alert: 告警信息（如有）
-                * triggered: 是否触发告警
-                * threshold: 告警阈值
-                * message: 告警消息
-    
-    使用示例:
-        # 示例1: 使用默认时间（最近1小时）
-        query_memory_metrics(service_name="data-sync-service")
-        
-        # 示例2: 指定时间范围
-        query_memory_metrics(
-            service_name="data-sync-service",
-            start_time="2026-02-14 10:00:00",
-            end_time="2026-02-14 11:00:00",
-            interval="5m"
-        )
+    数据来源：优先从 Prometheus 查询 node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes。
     """
-    # 解析时间参数
     start_dt = parse_time_or_default(start_time, default_offset_hours=-1)
     end_dt = parse_time_or_default(end_time, default_offset_hours=0)
-    
-    # 解析间隔时间（interval: 1m, 5m, 1h 等）
-    interval_minutes = 1  # 默认 1 分钟
+
+    interval_minutes = 1
     if interval.endswith('m'):
         interval_minutes = int(interval[:-1])
     elif interval.endswith('h'):
         interval_minutes = int(interval[:-1]) * 60
-    
-    # 动态生成内存使用率数据：从低到高逐渐增长
-    data_points = []
-    current_time = start_dt
-    time_index = 0
-    
-    # 初始内存使用率（30%）
-    base_memory = 30.0
-    total_gb = 8.0  # 总内存 8GB
-    
-    while current_time <= end_dt:
-        # 内存使用率逐渐升高的算法：
-        # - 前几个数据点保持在 30% 左右
-        # - 然后开始逐步上升
-        # - 最终达到 85% 左右
-        
-        if time_index < 3:
-            # 初始阶段：30% 左右波动
-            memory_value = base_memory + (time_index * 1.0)
+
+    step = parse_step(interval)
+    start_ep = epoch_timestamp(start_dt)
+    end_ep = epoch_timestamp(end_dt)
+
+    # 内存使用率 = (1 - MemAvailable / MemTotal) * 100
+    promql = (
+        f'100 * (1 - avg(node_memory_MemAvailable_bytes{{job="node_exporter"}} '
+        f'/ node_memory_MemTotal_bytes{{job="node_exporter"}}) by (instance))'
+    )
+
+    result = query_prometheus(promql, start=start_ep, end=end_ep, step=step)
+
+    if result and result.get("result"):
+        raw_values = result["result"][0].get("values", [])
+        data_points = build_data_points(raw_values, start_dt, interval_minutes)
+        if data_points:
+            source = "Prometheus"
         else:
-            # 上升阶段：使用线性增长模型（内存增长比 CPU 慢）
-            growth_factor = (time_index - 2) * 5.5
-            memory_value = min(base_memory + growth_factor, 85.0)
-        
-        # 添加一些随机波动（±1%）
-        memory_value = round(memory_value + random.uniform(-1, 1), 1)
-        memory_value = max(0, min(100, memory_value))  # 确保在 0-100 范围内
-        
-        # 计算已使用内存（GB）
-        used_gb = round((memory_value / 100.0) * total_gb, 2)
-        
-        data_point = {
-            "timestamp": current_time.strftime("%H:%M"),
-            "value": memory_value,
-            "used_gb": used_gb,
-            "total_gb": total_gb
-        }
-        
-        data_points.append(data_point)
-        
-        # 下一个时间点
-        current_time += timedelta(minutes=interval_minutes)
-        time_index += 1
-    
-    # 计算统计信息
+            data_points = gen_fallback_memory(start_dt, end_dt, interval_minutes)
+            source = "模拟数据 (Prometheus 无数据)"
+    else:
+        data_points = gen_fallback_memory(start_dt, end_dt, interval_minutes)
+        source = "模拟数据 (Prometheus 不可用)"
+
     if data_points:
         values = [d["value"] for d in data_points]
-        avg_value = round(sum(values) / len(values), 2)
-        max_value = max(values)
-        min_value = min(values)
-        
-        # 检测是否有内存压力（超过 70%）
-        memory_pressure = max_value > 70.0
-        
+        avg_v = round(sum(values) / len(values), 2)
+        max_v = round(max(values), 2)
+        min_v = round(min(values), 2)
+        sv = sorted(values)
+        p95_v = round(sv[max(0, int(len(sv) * 0.95) - 1)], 2)
+        pressure = max_v > 70.0
+
         return {
             "service_name": service_name,
             "metric_name": "memory_usage_percent",
             "interval": interval,
+            "data_source": source,
             "data_points": data_points,
             "statistics": {
-                "avg": avg_value,
-                "max": max_value,
-                "min": min_value,
-                "p95": round(sorted(values)[int(len(values) * 0.95)] if len(values) > 1 else max_value, 2),
-                "memory_pressure": memory_pressure
+                "avg": avg_v, "max": max_v, "min": min_v, "p95": p95_v,
+                "memory_pressure": pressure
             },
             "alert_info": {
-                "triggered": memory_pressure,
+                "triggered": pressure,
                 "threshold": 70.0,
-                "message": "内存使用率超过 70% 阈值，存在内存压力" if memory_pressure else "内存使用率正常"
+                "message": "内存使用率超过 70% 阈值，存在内存压力" if pressure else "内存使用率正常"
             }
         }
+    return {
+        "service_name": service_name, "metric_name": "memory_usage_percent",
+        "interval": interval, "data_source": source,
+        "data_points": [], "statistics": {}, "error": "未能获取内存数据"
+    }
+
+
+@mcp.tool()
+@log_tool_call
+def query_disk_metrics(
+    service_name: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    interval: str = "1m"
+) -> Dict[str, Any]:
+    """查询服务的磁盘使用监控数据。
+
+    数据来源：优先从 Prometheus 查询 node_filesystem_avail_bytes / node_filesystem_size_bytes。
+    """
+    start_dt = parse_time_or_default(start_time, default_offset_hours=-1)
+    end_dt = parse_time_or_default(end_time, default_offset_hours=0)
+
+    interval_minutes = 1
+    if interval.endswith('m'):
+        interval_minutes = int(interval[:-1])
+    elif interval.endswith('h'):
+        interval_minutes = int(interval[:-1]) * 60
+
+    step = parse_step(interval)
+    start_ep = epoch_timestamp(start_dt)
+    end_ep = epoch_timestamp(end_dt)
+
+    # 磁盘使用率 = (1 - avail / size) * 100
+    # 注意：不要用 max by (instance) 包裹后再除法，PromQL 不支持这种跨指标的去重除法。
+    # 直接用 avail / size 让 PromQL 按全量标签自动对齐，再用 Python 去重。
+    promql = (
+        f'100 * (1 - node_filesystem_avail_bytes{{fstype="ext4", '
+        f'job="node_exporter"}} / node_filesystem_size_bytes{{fstype="ext4", '
+        f'job="node_exporter"}})'
+    )
+
+    result = query_prometheus(promql, start=start_ep, end=end_ep, step=step)
+
+    if result and result.get("result"):
+        series_list = result["result"]
+        # 去重：同一 device+fstype 可能有多个重复 mountpoint（Docker Desktop WSL 特性），
+        # 只保留最短的那个（通常是真实挂载点）。
+        seen_devices: Dict[str, str] = {}
+        for series in series_list:
+            labels = series.get("labels", {})
+            dev = labels.get("device", "unknown")
+            mp = labels.get("mountpoint", "")
+            if dev not in seen_devices or len(mp) < len(seen_devices[dev]):
+                seen_devices[dev] = mp
+        dedup_set = set(seen_devices.values())
+        # 只保留去重后的 series
+        deduped_series = [s for s in series_list if s.get("labels", {}).get("mountpoint", "") in dedup_set]
+        if deduped_series:
+            # 取第一个 series 的 values（所有 series 的 values 相同，只是标签不同）
+            raw_values = deduped_series[0].get("values", [])
+            data_points = build_data_points(raw_values, start_dt, interval_minutes)
+            source = "Prometheus"
+        else:
+            data_points = gen_fallback_disk(start_dt, end_dt, interval_minutes)
+            source = "模拟数据 (Prometheus 无数据)"
     else:
+        data_points = gen_fallback_disk(start_dt, end_dt, interval_minutes)
+        source = "模拟数据 (Prometheus 不可用)"
+
+    if data_points:
+        values = [d["value"] for d in data_points]
+        avg_v = round(sum(values) / len(values), 2)
+        max_v = round(max(values), 2)
+        min_v = round(min(values), 2)
+        sv = sorted(values)
+        p95_v = round(sv[max(0, int(len(sv) * 0.95) - 1)], 2)
+        warning = max_v > 75.0
+        critical = max_v > 90.0
+
         return {
             "service_name": service_name,
-            "metric_name": "memory_usage_percent",
+            "metric_name": "disk_usage_percent",
             "interval": interval,
-            "data_points": [],
-            "statistics": {},
-            "error": "时间范围无效或没有生成数据点"
+            "data_source": source,
+            "data_points": data_points,
+            "statistics": {
+                "avg": avg_v, "max": max_v, "min": min_v, "p95": p95_v,
+                "disk_warning": warning, "disk_critical": critical
+            },
+            "alert_info": {
+                "triggered": warning,
+                "threshold": 75.0,
+                "level": "critical" if critical else "warning",
+                "message": "磁盘使用率严重超标（超过 90%）" if critical else (
+                    "磁盘使用率超过 75% 阈值，请注意清理" if warning else "磁盘使用率正常"
+                )
+            }
+        }
+    return {
+        "service_name": service_name, "metric_name": "disk_usage_percent",
+        "interval": interval, "data_source": source,
+        "data_points": [], "statistics": {}, "error": "未能获取磁盘数据"
+    }
+
+
+@mcp.tool()
+@log_tool_call
+def query_network_metrics(
+    service_name: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    interval: str = "1m"
+) -> Dict[str, Any]:
+    """查询服务的网络流量监控数据。
+
+    数据来源：优先从 Prometheus 查询 node_network_receive_bytes_total / node_network_transmit_bytes_total。
+    """
+    start_dt = parse_time_or_default(start_time, default_offset_hours=-1)
+    end_dt = parse_time_or_default(end_time, default_offset_hours=0)
+
+    interval_minutes = 1
+    if interval.endswith('m'):
+        interval_minutes = int(interval[:-1])
+    elif interval.endswith('h'):
+        interval_minutes = int(interval[:-1]) * 60
+
+    step = parse_step(interval)
+    start_ep = epoch_timestamp(start_dt)
+    end_ep = epoch_timestamp(end_dt)
+
+    # 网络收发速率（bytes/s），用 max by 去重
+    promql_rx = (
+        f'max by (instance) (rate(node_network_receive_bytes_total{{device!="lo", '
+        f'job="node_exporter"}}[{step}]))'
+    )
+    promql_tx = (
+        f'max by (instance) (rate(node_network_transmit_bytes_total{{device!="lo", '
+        f'job="node_exporter"}}[{step}]))'
+    )
+
+    result_rx = query_prometheus(promql_rx, start=start_ep, end=end_ep, step=step)
+    result_tx = query_prometheus(promql_tx, start=start_ep, end=end_ep, step=step)
+
+    source = "Prometheus"
+    rx_raw = result_rx["result"][0].get("values", []) if result_rx and result_rx.get("result") else []
+    tx_raw = result_tx["result"][0].get("values", []) if result_tx and result_tx.get("result") else []
+
+    if not rx_raw or not tx_raw:
+        source = "模拟数据 (Prometheus 不可用)"
+        rx_raw = [(str(int(start_dt.timestamp())), "0")] * 10
+        tx_raw = [(str(int(start_dt.timestamp())), "0")] * 10
+
+    data_points = []
+    ct = start_dt
+    for i, (rx_ts, rx_val) in enumerate(rx_raw):
+        try:
+            rx_bps = float(rx_val)
+            tx_ts, tx_val = tx_raw[i] if i < len(tx_raw) else ("0", "0")
+            tx_bps = float(tx_val)
+        except (ValueError, IndexError):
+            continue
+        data_points.append({
+            "timestamp": ct.strftime("%H:%M"),
+            "rx_bytes_per_sec": round(rx_bps, 2),
+            "tx_bytes_per_sec": round(tx_bps, 2),
+            "rx_mbps": round(rx_bps * 8 / 1_000_000, 2),
+            "tx_mbps": round(tx_bps * 8 / 1_000_000, 2),
+        })
+        ct += timedelta(minutes=interval_minutes)
+
+    if not data_points:
+        data_points = gen_fallback_network(start_dt, end_dt, interval_minutes)
+        source = "模拟数据 (Prometheus 无数据)"
+
+    if data_points:
+        rx_rates = [d["rx_mbps"] for d in data_points]
+        tx_rates = [d["tx_mbps"] for d in data_points]
+        return {
+            "service_name": service_name,
+            "metric_name": "network_throughput_mbps",
+            "interval": interval,
+            "data_source": source,
+            "data_points": data_points,
+            "statistics": {
+                "rx_avg_mbps": round(sum(rx_rates) / len(rx_rates), 2),
+                "rx_max_mbps": round(max(rx_rates), 2),
+                "tx_avg_mbps": round(sum(tx_rates) / len(tx_rates), 2),
+                "tx_max_mbps": round(max(tx_rates), 2),
+            },
+            "alert_info": {
+                "triggered": False, "threshold": 1000.0,
+                "message": "网络流量正常"
+            }
+        }
+    return {
+        "service_name": service_name, "metric_name": "network_throughput_mbps",
+        "interval": interval, "data_source": source,
+        "data_points": [], "statistics": {}, "error": "未能获取网络数据"
+    }
+
+
+@mcp.tool()
+@log_tool_call
+def query_process_info(
+    service_name: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+) -> Dict[str, Any]:
+    """查询服务的进程运行状态信息。
+
+    数据来源：优先从 Prometheus 查询 node_procs_running / node_procs_blocked。
+    """
+    promql_running = 'node_procs_running{job="node_exporter"}'
+    promql_blocked = 'node_procs_blocked{job="node_exporter"}'
+
+    running = query_prometheus_single(promql_running)
+    blocked = query_prometheus_single(promql_blocked)
+
+    if running is not None or blocked is not None:
+        source = "Prometheus"
+        process_info = {"running": running if running is not None else 0, "blocked": blocked if blocked is not None else 0}
+    else:
+        source = "模拟数据 (Prometheus 不可用)"
+        process_info = {"running": random.randint(1, 5), "blocked": random.randint(0, 2)}
+
+    return {
+        "service_name": service_name,
+        "data_source": source,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "process_info": process_info,
+        "alert_info": {
+            "triggered": process_info.get("blocked", 0) > 3,
+            "threshold": 3,
+            "message": "存在阻塞进程" if process_info.get("blocked", 0) > 3 else "进程状态正常"
+        }
+    }
+
+
+# ============================================================
+# 本地 Windows 磁盘查询（psutil）
+# ============================================================
+
+@mcp.tool()
+@log_tool_call
+def query_local_disk_metrics() -> Dict[str, Any]:
+    """查询本机 Windows 磁盘使用率（通过 psutil，不依赖 Prometheus）。
+
+    适用于 Windows 本机环境，直接读取本地磁盘分区信息。
+
+    Returns:
+        Dict: 所有本地磁盘分区的使用情况，包含:
+            - disks: 磁盘列表，每个包含:
+                * device: 设备名 (如 C:, D:)
+                * label: 卷标
+                * total_gb: 总容量 (GB)
+                * used_gb: 已用容量 (GB)
+                * free_gb: 剩余容量 (GB)
+                * usage_percent: 使用率 (%)
+                * mount_point: 挂载点
+                * warning: 是否超过 75% 阈值
+                * critical: 是否超过 90% 阈值
+            - overall_alert: 最高级别的告警信息
+    """
+    try:
+        import psutil
+    except ImportError:
+        return {
+            "error": "psutil 未安装，请运行: pip install psutil",
+            "disks": []
         }
 
+    partitions = psutil.disk_partitions(all=False)
+    disks = []
+    max_usage = 0.0
+    max_level = "normal"
 
+    for p in partitions:
+        try:
+            usage = psutil.disk_usage(p.mountpoint)
+        except (PermissionError, OSError):
+            continue
+
+        total_gb = round(usage.total / (1024**3), 2)
+        used_gb = round(usage.used / (1024**3), 2)
+        free_gb = round(usage.free / (1024**3), 2)
+        usage_percent = round(usage.percent, 1)
+
+        warning = usage_percent > 75.0
+        critical = usage_percent > 90.0
+
+        disks.append({
+            "device": p.device,
+            "label": getattr(p, "label", "") or "",
+            "mount_point": p.mountpoint,
+            "total_gb": total_gb,
+            "used_gb": used_gb,
+            "free_gb": free_gb,
+            "usage_percent": usage_percent,
+            "warning": warning,
+            "critical": critical,
+        })
+
+        if usage_percent > max_usage:
+            max_usage = usage_percent
+            if critical:
+                max_level = "critical"
+            elif warning:
+                max_level = "warning"
+
+    # 按使用率排序，高的在前
+    disks.sort(key=lambda x: x["usage_percent"], reverse=True)
+
+    alert_message = "所有磁盘使用率正常"
+    if max_level == "critical":
+        alert_message = f"磁盘使用率严重超标！最高使用率: {max_usage}%"
+    elif max_level == "warning":
+        alert_message = f"磁盘使用率较高，请注意清理。最高使用率: {max_usage}%"
+
+    return {
+        "data_source": "本地 psutil",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "disks": disks,
+        "overall_alert": {
+            "level": max_level,
+            "max_usage_percent": round(max_usage, 1),
+            "message": alert_message
+        }
+    }
 
 
 if __name__ == "__main__":
-    # 使用 streamable-http 模式，运行在 8004 端口
     mcp.run(transport="streamable-http", host="127.0.0.1", port=8004, path="/mcp")

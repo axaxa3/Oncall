@@ -1,0 +1,42 @@
+groups:
+  - name: node_alerts
+    rules:
+      # CPU 使用率 > 80% 持续 3 分钟
+      - alert: HighCPUUsage
+        expr: 100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle", job="node_exporter"}[5m])) by (instance)) > 80
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU 使用率过高"
+          description: "实例 {{ $labels.instance }} 的 CPU 使用率超过 80%，当前值为 {{ $value | printf \"%.1f\" }}%"
+
+      # 内存使用率 > 70% 持续 3 分钟
+      - alert: HighMemoryUsage
+        expr: 100 * (1 - avg(node_memory_MemAvailable_bytes{job="node_exporter"} / node_memory_MemTotal_bytes{job="node_exporter"}) by (instance)) > 70
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用率过高"
+          description: "实例 {{ $labels.instance }} 的内存使用率超过 70%，当前值为 {{ $value | printf \"%.1f\" }}%"
+
+      # 磁盘使用率 > 75% 持续 5 分钟
+      - alert: HighDiskUsage
+        expr: 100 * (1 - node_filesystem_avail_bytes{fstype="ext4", job="node_exporter"} / node_filesystem_size_bytes{fstype="ext4", job="node_exporter"}) > 75
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "磁盘使用率过高"
+          description: "实例 {{ $labels.instance }} 的磁盘使用率超过 75%，当前值为 {{ $value | printf \"%.1f\" }}%"
+
+      # 磁盘使用率 > 90% 持续 5 分钟（严重）
+      - alert: CriticalDiskUsage
+        expr: 100 * (1 - node_filesystem_avail_bytes{fstype="ext4", job="node_exporter"} / node_filesystem_size_bytes{fstype="ext4", job="node_exporter"}) > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "磁盘空间即将耗尽"
+          description: "实例 {{ $labels.instance }} 的磁盘使用率超过 90%，当前值为 {{ $value | printf \"%.1f\" }}%"
